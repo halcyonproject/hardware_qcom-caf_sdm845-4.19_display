@@ -62,7 +62,11 @@
  */
 
 #ifndef QMAA
+#ifdef DISP_LEGACY_ALIGN
+#include <media/msm_media_info_msmnile.h>
+#else
 #include <media/msm_media_info.h>
+#endif
 #endif
 
 #include <drm/drm_fourcc.h>
