@@ -681,6 +681,7 @@ void HWCDisplay::BuildLayerStack() {
 
   DTRACE_SCOPED();
   // Add one layer for fb target
+  bool client_composition_below = false;
   for (auto hwc_layer : layer_set_) {
     // Reset layer data which SDM may change
     hwc_layer->ResetPerFrameData();
@@ -828,6 +829,10 @@ void HWCDisplay::BuildLayerStack() {
     if ((hwc_layer->GetDeviceSelectedCompositionType() != HWC2::Composition::Device) ||
         (hwc_layer->GetClientRequestedCompositionType() != HWC2::Composition::Device) ||
         layer->flags.skip) {
+      layer->update_mask.set(kClientCompRequest);
+      client_composition_below = true;
+    } else if (client_composition_below &&
+               (layer->blending != kBlendingOpaque || layer->plane_alpha < 255)) {
       layer->update_mask.set(kClientCompRequest);
     }
 
@@ -1455,15 +1460,25 @@ HWC2::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
     Layer *layer = hwc_layer->GetSDMLayer();
     LayerComposition &composition = layer->composition;
 
+    HWC2::Composition requested_composition = hwc_layer->GetClientRequestedCompositionType();
+
+    // If any layer below requires Client composition, all subsequent non-opaque layers
+    // (such as translucent windows, bottom sheets, or dialogs with alpha) must also be
+    // Client composed. SDM845 DPU cannot blend hardware overlay planes on top of a GPU
+    // Client Target with alpha blending, causing missing/invisible windows (e.g. MediaPicker).
+    if (has_client_composition_ && (layer->blending != kBlendingOpaque || layer->plane_alpha < 255)) {
+      composition = kCompositionGPU;
+    }
+
     if (composition == kCompositionSDE || composition == kCompositionStitch) {
       layer_requests_[hwc_layer->GetId()] = HWC2::LayerRequest::ClearClientTarget;
     }
 
-    HWC2::Composition requested_composition = hwc_layer->GetClientRequestedCompositionType();
     // Set SDM composition to HWC2 type in HWCLayer
     hwc_layer->SetComposition(composition);
     HWC2::Composition device_composition  = hwc_layer->GetDeviceSelectedCompositionType();
-    if (device_composition == HWC2::Composition::Client) {
+    if (device_composition == HWC2::Composition::Client ||
+        requested_composition == HWC2::Composition::Client) {
       has_client_composition_ = true;
     }
     // Update the changes list only if the requested composition is different from SDM comp type
