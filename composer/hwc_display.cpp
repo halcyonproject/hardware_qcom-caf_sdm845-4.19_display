@@ -257,10 +257,11 @@ HWC2::Error HWCColorMode::SetPreferredColorModeInternal(const std::string &mode_
       }
     }
 
-    if (color_gamut_string.empty() || dynamic_range_string.empty()) {
-      DLOGE("Invalid attributes for mode %s: color_gamut = %s, dynamic_range = %s",
-            mode_string.c_str(), color_gamut_string.c_str(), dynamic_range_string.c_str());
-      return HWC2::Error::BadParameter;
+    if (color_gamut_string.empty()) {
+      color_gamut_string = kNative;
+    }
+    if (dynamic_range_string.empty()) {
+      dynamic_range_string = kSdr;
     }
 
     if (color_gamut_string == kDcip3) {
