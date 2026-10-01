@@ -711,6 +711,15 @@ void HWCDisplay::BuildLayerStack() {
       layer->flags.skip = true;
     }
 
+    // If any layer below requires Client composition, all subsequent non-opaque layers
+    // (such as translucent windows, bottom sheets, or dialogs with alpha) must also be
+    // Client composed. SDM845 DPU cannot blend hardware overlay planes on top of a GPU
+    // Client Target with alpha blending, causing missing/invisible windows (e.g. MediaPicker).
+    if (client_composition_below &&
+        (layer->blending != kBlendingOpaque || layer->plane_alpha < 255)) {
+      layer->flags.skip = true;
+    }
+
     // set default composition as GPU for SDM
     layer->composition = kCompositionGPU;
 
@@ -832,9 +841,6 @@ void HWCDisplay::BuildLayerStack() {
         layer->flags.skip) {
       layer->update_mask.set(kClientCompRequest);
       client_composition_below = true;
-    } else if (client_composition_below &&
-               (layer->blending != kBlendingOpaque || layer->plane_alpha < 255)) {
-      layer->update_mask.set(kClientCompRequest);
     }
 
     layer_stack_.layers.push_back(layer);
@@ -1457,19 +1463,44 @@ HWC2::Error HWCDisplay::PrepareLayerStack(uint32_t *out_num_types, uint32_t *out
     geometry_changes_on_doze_suspend_ = GeometryChanges::kNone;
   }
 
+  bool reprepare = false;
+  bool client_comp_found = false;
+  for (auto hwc_layer : layer_set_) {
+    Layer *layer = hwc_layer->GetSDMLayer();
+    if (layer->composition == kCompositionGPU || layer->flags.skip) {
+      client_comp_found = true;
+    } else if (client_comp_found &&
+               (layer->blending != kBlendingOpaque || layer->plane_alpha < 255)) {
+      layer->flags.skip = true;
+      layer_stack_.flags.skip_present = true;
+      reprepare = true;
+    }
+  }
+
+  if (reprepare) {
+    error = display_intf_->Prepare(&layer_stack_);
+    if (error != kErrorNone) {
+      if (error == kErrorShutDown) {
+        shutdown_pending_ = true;
+      } else if (error == kErrorPermission) {
+        WaitOnPreviousFence();
+        MarkLayersForGPUBypass();
+        geometry_changes_on_doze_suspend_ |= geometry_changes_;
+      } else {
+        DLOGW("Re-prepare failed. Error = %d", error);
+        flush_ = true;
+        validated_ = false;
+        callbacks_->Refresh(id_);
+        return HWC2::Error::BadDisplay;
+      }
+    }
+  }
+
   for (auto hwc_layer : layer_set_) {
     Layer *layer = hwc_layer->GetSDMLayer();
     LayerComposition &composition = layer->composition;
 
     HWC2::Composition requested_composition = hwc_layer->GetClientRequestedCompositionType();
-
-    // If any layer below requires Client composition, all subsequent non-opaque layers
-    // (such as translucent windows, bottom sheets, or dialogs with alpha) must also be
-    // Client composed. SDM845 DPU cannot blend hardware overlay planes on top of a GPU
-    // Client Target with alpha blending, causing missing/invisible windows (e.g. MediaPicker).
-    if (has_client_composition_ && (layer->blending != kBlendingOpaque || layer->plane_alpha < 255)) {
-      composition = kCompositionGPU;
-    }
 
     if (composition == kCompositionSDE || composition == kCompositionStitch) {
       layer_requests_[hwc_layer->GetId()] = HWC2::LayerRequest::ClearClientTarget;
@@ -1751,10 +1782,10 @@ HWC2::Error HWCDisplay::PostCommitLayerStack(shared_ptr<Fence> *out_retire_fence
       // If swapinterval property is set to 0 or for single buffer layers, do not update f/w
       // release fences and discard fences from driver
       if (!swap_interval_zero_ && !layer->flags.single_buffer) {
-        // It may so happen that layer gets marked to GPU & app layer gets queued
-        // to MDP for composition. In those scenarios, release fence of buffer should
-        // have mdp and gpu sync points merged.
-        hwc_layer->PushBackReleaseFence(layer_buffer->release_fence);
+        // For skipped (GPU) layers, display hardware does not touch the layer buffer.
+        // Therefore, do not return any hardware release fence.
+        shared_ptr<Fence> release_fence = layer->flags.skip ? nullptr : layer_buffer->release_fence;
+        hwc_layer->PushBackReleaseFence(release_fence);
       }
     } else {
       // In case of flush or display paused, we don't return an error to f/w, so it will
@@ -1765,6 +1796,7 @@ HWC2::Error HWCDisplay::PostCommitLayerStack(shared_ptr<Fence> *out_retire_fence
 
     layer->request.flags = {};
     layer_buffer->acquire_fence = nullptr;
+    layer_buffer->release_fence = nullptr;
   }
 
   client_target_->GetSDMLayer()->request.flags = {};
